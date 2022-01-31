@@ -1,0 +1,105 @@
+---
+- name: Docker Installation Process
+  hosts: all
+  become: yes
+  vars:
+    docker_compose_bin_loc: /usr/local/lib/docker/cli-plugins
+  tasks:
+    - when: (ansible_distribution | lower) == 'ubuntu'
+      block:
+        - name: upgrade the system
+          ansible.builtin.apt:
+            update_cache: yes
+            upgrade: yes
+
+        - name: install pre-requisite packages
+          ansible.builtin.apt:
+            name:
+              - ca-certificates
+              - curl
+              - gnupg
+              - lsb-release
+            state: present
+
+        # see this regarding apt-key deprecation:
+        # https://linuxuprising.com/2021/01/apt-key-is-deprecated-how-to-add.html
+        - name: install docker's GPG key
+          ansible.builtin.shell:
+            cmd: "/usr/bin/curl -fsSL https://download.docker.com/linux/ubuntu/gpg | /usr/bin/gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg"
+            creates: /usr/share/keyrings/docker-archive-keyring.gpg
+
+        # {{ansible_architecture}} returns x86_64 instead of amd64
+        - name: query CPU architecture with dpkg
+          ansible.builtin.command:
+            cmd: "/usr/bin/dpkg --print-architecture"
+          register: dpkg_query
+          # disable change reporting
+          changed_when: false
+
+        - name: add docker's repository
+          ansible.builtin.apt_repository:
+            # repo templating according to Docker's documentation
+            repo: "deb [arch={{ dpkg_query.stdout }} signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu   {{ ansible_lsb.codename }} stable"
+            filename: docker # .list extension is automatically added
+            state: present
+
+        - name: install docker & related packages from repos
+          ansible.builtin.apt:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+
+        - name: make sure docker can run without sudo privileges
+          block:
+            - name: Add docker group
+              ansible.builtin.group:
+                name: docker
+                state: present
+
+            # didn't work for me through playbook.
+            # worked as an ad-hoc command however.
+            - name: add current user to the docker group
+              ansible.builtin.user:
+                name: "{{ ansible_user_id }}"
+                groups: docker
+                append: yes
+                state: present
+
+            # didn't work through playbook
+            # - name: add user to the group
+            #   ansible.builtin.shell:
+            #     cmd: "/usr/sbin/usermod -aG docker {{ ansible_user_id }}"
+
+            # to make the group available in the playbook without restart
+            # - name: reset connection
+            #   ansible.builtin.meta: reset_connection
+
+        - name: enable docker and containerd service
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+            enabled: yes
+          loop:
+            - docker.service
+            - containerd.service
+
+        - name: create system-wide docker cli-plugins directory
+          ansible.builtin.file:
+            owner: "{{ ansible_user_id }}"
+            group: "{{ ansible_user_id }}"
+            mode: "755"
+            path: "{{ docker_compose_bin_loc }}"
+            state: directory
+
+        - name: download `docker-compose` binary
+          ansible.builtin.get_url:
+            # url templating according to compose docs' install instructions
+            url: "https://github.com/docker/compose/releases/download/v2.2.3/docker-compose-{{ ansible_system }}-{{ ansible_architecture }}"
+            # file name essential for docker to pick it up as a valid plugin
+            dest: "{{ docker_compose_bin_loc }}/docker-compose"
+            owner: "{{ ansible_user_id }}"
+            group: "{{ ansible_user_id }}"
+            mode: "755"
+        # to bring group changes to effect (but group never gets modified)
+        - name: restart the machine
+          ansible.builtin.reboot:
